@@ -689,7 +689,6 @@ def main():
     summary_stats = {"total_size": 0, "types": {}, "failed": 0, "success": 0, "skipped": 0}
 
     # --- FASE DE VERIFICACION ---
-    console.print(f"[yellow]⏳ Verificando {len(files_to_download)} archivos locales antes de descargar...[/yellow]")
     real_files_to_download = []
     
     def verify_local_file(f):
@@ -709,14 +708,50 @@ def main():
                     os.remove(final_path)
         return ("download", f)
         
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for status, f in pool.map(verify_local_file, files_to_download):
-            if status == "skipped":
-                summary_stats["skipped"] += 1
-            else:
-                real_files_to_download.append(f)
+    with Progress(
+        TextColumn("[bold yellow]⏳ Verificando archivos locales...[/bold yellow]"),
+        BarColumn(complete_style="yellow"),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        "•",
+        TextColumn("{task.completed}/{task.total} archivos"),
+        console=console,
+        transient=True
+    ) as verify_prog:
+        v_task = verify_prog.add_task("Verificando", total=len(files_to_download))
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(verify_local_file, f) for f in files_to_download]
+            for future in as_completed(futures):
+                status, f = future.result()
+                if status == "skipped":
+                    summary_stats["skipped"] += 1
+                else:
+                    real_files_to_download.append(f)
+                verify_prog.update(v_task, advance=1)
                 
     files_to_download = real_files_to_download
+    
+    # Rebuild tree with only missing files
+    tree = Tree(t("tree_root"))
+    def add_to_tree(node, tree_parent, path_parts):
+        if not path_parts:
+            tree_parent.add(f"[green]📄 {node['name']}[/green] ({format_size(node.get('size', 0))})")
+            return
+        
+        part = path_parts[0]
+        # find or create branch
+        branch = next((child for child in tree_parent.children if getattr(child, "label", "") == f"[bold blue]📁 {part}[/bold blue]"), None)
+        if not branch:
+            branch = tree_parent.add(f"[bold blue]📁 {part}[/bold blue]")
+        add_to_tree(node, branch, path_parts[1:])
+        
+    for f in files_to_download:
+        rel = f.get("rel_path", "")
+        parts = rel.split(os.sep) if rel else []
+        parts = [p for p in parts if p]
+        add_to_tree(f, tree, parts)
+        
+    console.print(tree)
+    console.print("")
     
     if not files_to_download:
         console.print("[bold green]¡Todos los archivos ya están descargados y verificados![/bold green]")
@@ -782,11 +817,42 @@ def main():
                         progress.update(overall_task, display_name=new_text)
                 except: pass
                 
-            if failed_files and not stop_event.is_set():
-                console.print(f"[yellow]⏳ Reintentando {len(failed_files)} archivos fallidos...[/yellow]")
-                time.sleep(2)
-                retry_futures = queue_downloads(failed_files)
-                for future in as_completed(retry_futures):
+    if failed_files and not stop_event.is_set():
+        console.print(f"\n[yellow]⏳ Reintentando {len(failed_files)} archivos fallidos en 2 segundos...[/yellow]")
+        time.sleep(2)
+        
+        retry_bytes = sum(f.get("size", 0) for f in failed_files)
+        
+        progress_retry = Progress(
+            TextColumn("{task.fields[display_name]}", justify="right"),
+            BarColumn(bar_width=None, complete_style="yellow", finished_style="bold green"),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            DownloadColumn(),
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeRemainingColumn(),
+            console=console,
+            expand=True
+        )
+        
+        with progress_retry:
+            tot_retry = len(failed_files)
+            retry_task = progress_retry.add_task(
+                "Retry", 
+                display_name=f"[bold yellow]Reintentos: {tot_retry} | Éxito: 0 | Restantes: {tot_retry}[/bold yellow]", 
+                total=retry_bytes
+            )
+            
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                retry_futs = []
+                for f in failed_files:
+                    if stop_event.is_set(): break
+                    retry_futs.append(pool.submit(download_file, f, base_dest, progress_retry, used_token, retry_task))
+                    
+                retry_success = 0
+                for future in as_completed(retry_futs):
                     try:
                         res = future.result()
                         if res:
@@ -794,15 +860,17 @@ def main():
                             if not ext: ext = "Desconocido"
                             if status == "success":
                                 summary_stats["success"] += 1
+                                summary_stats["failed"] -= 1 # Move from failed to success
                                 summary_stats["total_size"] += size
                                 if ext not in summary_stats["types"]:
                                     summary_stats["types"][ext] = {"count": 0, "size": 0}
                                 summary_stats["types"][ext]["count"] += 1
                                 summary_stats["types"][ext]["size"] += size
-                            elif status == "skipped":
-                                summary_stats["skipped"] += 1
-                            else:
-                                summary_stats["failed"] += 1
+                                retry_success += 1
+                            
+                            dn = retry_success
+                            new_text = f"[bold yellow]Reintentos: {tot_retry} | Éxito: {dn} | Restantes: {tot_retry - dn}[/bold yellow]"
+                            progress_retry.update(retry_task, display_name=new_text)
                     except: pass
                 
     if not stop_event.is_set():
