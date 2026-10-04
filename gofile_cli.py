@@ -427,7 +427,6 @@ def generate_file_list(node, current_path="", seen_paths=None):
         node["rel_path"] = current_path
         full_path = os.path.join(current_path, node["name"])
         if full_path in seen_paths:
-            import os
             base, ext = os.path.splitext(node["name"])
             short_id = node.get("id", "dup")[:6]
             node["name"] = f"{base}_{short_id}{ext}"
