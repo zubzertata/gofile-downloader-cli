@@ -615,8 +615,9 @@ def main():
     files_iterator = []
     if data.get("type") == "folder":
         def yield_children():
+            seen = {}
             for child_id, child_node in data.get("children", {}).items():
-                yield from generate_file_list(child_node, "")
+                yield from generate_file_list(child_node, "", seen)
         files_iterator = yield_children()
     else:
         data["rel_path"] = ""
@@ -867,6 +868,7 @@ def main():
                     retry_futs.append(pool.submit(download_file, f, base_dest, progress_retry, used_token, retry_task))
                     
                 retry_success = 0
+                retry_fail = 0
                 for future in as_completed(retry_futs):
                     try:
                         res = future.result()
@@ -883,8 +885,9 @@ def main():
                                 summary_stats["types"][ext]["size"] += size
                                 retry_success += 1
                             
-                            dn = retry_success
-                            new_text = f"[bold yellow]Reintentos: {tot_retry} | Éxito: {dn} | Restantes: {tot_retry - dn}[/bold yellow]"
+                            dn = retry_success + retry_fail
+                            fail_text = f" | [red]Fallidos: {retry_fail}[/red]" if retry_fail > 0 else ""
+                            new_text = f"[bold yellow]Reintentos: {tot_retry} | Éxito: {retry_success}{fail_text} | Restantes: {tot_retry - dn}[/bold yellow]"
                             progress_retry.update(retry_task, display_name=new_text)
                     except: pass
                 
