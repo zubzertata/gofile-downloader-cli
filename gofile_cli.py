@@ -417,12 +417,22 @@ def build_tree_ui(node, tree):
         size_str = format_size(node.get('size', 0))
         tree.add(f"[green]📄 {node['name']}[/green] ({size_str})")
 
-def generate_file_list(node, current_path=""):
+def generate_file_list(node, current_path="", seen_paths=None):
+    if seen_paths is None:
+        seen_paths = {}
     if node.get("type") == "folder":
         for child_id, child_node in node.get("children", {}).items():
-            yield from generate_file_list(child_node, os.path.join(current_path, node["name"]))
+            yield from generate_file_list(child_node, os.path.join(current_path, node["name"]), seen_paths)
     else:
         node["rel_path"] = current_path
+        full_path = os.path.join(current_path, node["name"])
+        if full_path in seen_paths:
+            import os
+            base, ext = os.path.splitext(node["name"])
+            short_id = node.get("id", "dup")[:6]
+            node["name"] = f"{base}_{short_id}{ext}"
+            full_path = os.path.join(current_path, node["name"])
+        seen_paths[full_path] = True
         yield node
 
 def download_file(file_info, dest_folder, progress, token, overall_task):
