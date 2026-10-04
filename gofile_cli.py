@@ -439,7 +439,8 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
     
     final_path = os.path.join(final_dir, filename)
     display_name = os.path.join(rel_path, filename).replace("\\", "/")
-    task_id = progress.add_task(t("dl_task"), display_name=t("waiting", name=display_name), total=size)
+    short_disp = display_name if len(display_name) <= 30 else "..." + display_name[-27:]
+    task_id = progress.add_task(t("dl_task"), display_name=t("waiting", name=short_disp), total=size)
     
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
@@ -465,7 +466,7 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
                 downloaded = 0
                 mode = "wb"
 
-        progress.update(task_id, completed=downloaded, display_name=f"[cyan]⬇ {display_name}[/cyan]")
+        progress.update(task_id, completed=downloaded, display_name=f"[cyan]⬇ {short_disp}[/cyan]")
         
         try:
             with requests.get(link, headers=headers, stream=True, proxies=proxies, timeout=(10, 30)) as r:
@@ -494,7 +495,7 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
         except Exception as e:
             if attempt < 2:
                 backoff = 2 ** (attempt + 1)
-                progress.update(task_id, display_name=f"[yellow]⏳ Reintentando en {backoff}s... {display_name}[/yellow]")
+                progress.update(task_id, display_name=f"[yellow]⏳ Reintentando en {backoff}s... {short_disp}[/yellow]")
                 time.sleep(backoff)
             else:
                 progress.update(task_id, visible=False)
@@ -602,10 +603,6 @@ def main():
     load_all_subfolders(data, max_workers=args.workers)
     fix_extensions(data)
         
-    tree = Tree(t("tree_title"))
-    build_tree_ui(data, tree)
-    console.print(tree)
-    
     files_iterator = []
     if data.get("type") == "folder":
         def yield_children():
@@ -732,17 +729,26 @@ def main():
     
     # Rebuild tree with only missing files
     tree = Tree(t("tree_root"))
-    def add_to_tree(node, tree_parent, path_parts):
+    folder_counts = {}
+    def add_to_tree(node, tree_parent, path_parts, current_path=""):
         if not path_parts:
-            tree_parent.add(f"[green]📄 {node['name']}[/green] ({format_size(node.get('size', 0))})")
+            # We are at the file level
+            folder_counts[current_path] = folder_counts.get(current_path, 0) + 1
+            if folder_counts[current_path] <= 5:
+                tree_parent.add(f"[green]📄 {node['name']}[/green] ({format_size(node.get('size', 0))})")
+            elif folder_counts[current_path] == 6:
+                tree_parent.add(f"[dim]... (y más archivos)[/dim]")
             return
         
         part = path_parts[0]
+        next_path = os.path.join(current_path, part)
+        
         # find or create branch
         branch = next((child for child in tree_parent.children if getattr(child, "label", "") == f"[bold blue]📁 {part}[/bold blue]"), None)
         if not branch:
             branch = tree_parent.add(f"[bold blue]📁 {part}[/bold blue]")
-        add_to_tree(node, branch, path_parts[1:])
+            
+        add_to_tree(node, branch, path_parts[1:], next_path)
         
     for f in files_to_download:
         rel = f.get("rel_path", "")
