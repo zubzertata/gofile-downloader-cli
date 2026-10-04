@@ -521,7 +521,7 @@ def print_banner():
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", style="bold cyan")
     grid.add_column(justify="right", style="dim")
-    grid.add_row("Gofile Downloader CLI", "v1")
+    grid.add_row("Gofile Downloader CLI", "v1.1.0")
     grid.add_row("High-performance multi-threaded client", "Cross-Platform")
     console.print(Panel(grid, border_style="blue", padding=(1, 2)))
 
@@ -829,7 +829,9 @@ def main():
                             
                         dn = summary_stats["success"] + len(failed_files)
                         tot_files = len(files_to_download)
-                        new_text = f"[bold yellow]Archivos: {tot_files} | Descargados: {dn} | Restantes: {tot_files - dn}[/bold yellow]"
+                        fail_count = len(failed_files)
+                        fail_text = f" | [red]Fallidos: {fail_count}[/red]" if fail_count > 0 else ""
+                        new_text = f"[bold yellow]Archivos: {tot_files} | Descargados: {summary_stats['success']}{fail_text} | Restantes: {tot_files - dn}[/bold yellow]"
                         progress.update(overall_task, display_name=new_text)
                 except: pass
                 
