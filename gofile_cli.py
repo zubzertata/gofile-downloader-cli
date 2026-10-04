@@ -426,7 +426,7 @@ def generate_file_list(node, current_path=""):
         yield node
 
 def download_file(file_info, dest_folder, progress, token, overall_task):
-    if stop_event.is_set(): return ("skipped", "", 0)
+    if stop_event.is_set(): return ("skipped", "", 0, file_info)
     
     filename = file_info["name"]
     link = file_info["link"]
@@ -451,7 +451,7 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
     headers["Origin"] = link
     
     for attempt in range(3):
-        if stop_event.is_set(): return ("skipped", "", 0)
+        if stop_event.is_set(): return ("skipped", "", 0, file_info)
         
         mode = "wb"
         downloaded = 0
@@ -461,17 +461,9 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
                 headers["Range"] = f"bytes={downloaded}-"
                 mode = "ab"
             elif size > 0 and downloaded >= size:
-                progress.update(task_id, display_name=t("md5_verify", name=display_name))
-                if verify_md5(final_path, expected_md5):
-                    progress.update(task_id, completed=size, display_name=f"[bright_black]✓ {display_name}[/bright_black]")
-                    progress.update(overall_task, advance=1)
-                    return ("skipped", ext, size)
-                else:
-                    os.remove(final_path)
-                    downloaded = 0
-                    mode = "wb"
-                    if "Range" in headers:
-                        del headers["Range"]
+                os.remove(final_path)
+                downloaded = 0
+                mode = "wb"
 
         progress.update(task_id, completed=downloaded, display_name=f"[cyan]⬇ {display_name}[/cyan]")
         
@@ -495,9 +487,9 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
                 if not verify_md5(final_path, expected_md5):
                     raise Exception("MD5 Hash Mismatch (Corrupt file)")
                 
-            progress.update(task_id, display_name=f"[bold green]✓ {display_name}[/bold green]")
-            progress.update(overall_task, advance=1)
-            return ("success", ext, size)
+            progress.update(task_id, visible=False)
+            progress.update(overall_task, advance=size)
+            return ("success", ext, size, file_info)
             
         except Exception as e:
             if attempt < 2:
@@ -505,14 +497,14 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
                 progress.update(task_id, display_name=f"[yellow]⏳ Reintentando en {backoff}s... {display_name}[/yellow]")
                 time.sleep(backoff)
             else:
-                progress.update(task_id, display_name=f"[red]✗ {display_name}[/red]")
+                progress.update(task_id, visible=False)
                 err_msg = str(e)
-                console.print(t("dl_err", name=display_name, err=err_msg))
-                log_error(f"Failed to download {display_name}: {err_msg}")
-                progress.update(overall_task, advance=1)
-                return ("failed", ext, size)
                 
-    return ("failed", ext, size)
+                log_error(f"Failed to download {display_name}: {err_msg}")
+                progress.update(overall_task, advance=size)
+                return ("failed", ext, size, file_info)
+                
+    return ("failed", ext, size, file_info)
 
 def print_banner():
     from rich.table import Table
@@ -694,11 +686,47 @@ def main():
             import ctypes
             ctypes.windll.kernel32.SetFileAttributesW(id_file, 2)
         
+    summary_stats = {"total_size": 0, "types": {}, "failed": 0, "success": 0, "skipped": 0}
+
+    # --- FASE DE VERIFICACION ---
+    console.print(f"[yellow]⏳ Verificando {len(files_to_download)} archivos locales antes de descargar...[/yellow]")
+    real_files_to_download = []
+    
+    def verify_local_file(f):
+        filename = f["name"]
+        rel_path = f.get("rel_path", "")
+        final_dir = os.path.join(base_dest, rel_path)
+        final_path = os.path.join(final_dir, filename)
+        size = f.get("size", 0)
+        expected_md5 = f.get("md5")
+        
+        if os.path.exists(final_path):
+            local_size = os.path.getsize(final_path)
+            if local_size == size and size > 0:
+                if verify_md5(final_path, expected_md5):
+                    return ("skipped", f)
+                else:
+                    os.remove(final_path)
+        return ("download", f)
+        
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for status, f in pool.map(verify_local_file, files_to_download):
+            if status == "skipped":
+                summary_stats["skipped"] += 1
+            else:
+                real_files_to_download.append(f)
+                
+    files_to_download = real_files_to_download
+    
+    if not files_to_download:
+        console.print("[bold green]¡Todos los archivos ya están descargados y verificados![/bold green]")
+        os._exit(0)
+
     console.print(t("start_dl", count=len(files_to_download), dest=base_dest))
     
-    summary_stats = {"total_size": 0, "types": {}, "failed": 0, "success": 0, "skipped": 0}
-    
     global_start_time = time.time()
+    
+    total_bytes_to_download = sum(f.get("size", 0) for f in files_to_download)
     
     progress = Progress(
         TextColumn("{task.fields[display_name]}", justify="right"),
@@ -715,18 +743,26 @@ def main():
     )
     
     with progress:
-        overall_task = progress.add_task(t("dl_task"), display_name=t("overall_prog"), total=len(files_to_download))
+        tot_files = len(files_to_download)
+        init_text = f"[bold yellow]Archivos: {tot_files} | Descargados: 0 | Restantes: {tot_files}[/bold yellow]"
+        overall_task = progress.add_task(t("dl_task"), display_name=init_text, total=total_bytes_to_download)
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = []
-            for f in files_to_download:
-                if stop_event.is_set(): break
-                futures.append(pool.submit(download_file, f, base_dest, progress, used_token, overall_task))
+            def queue_downloads(files):
+                futs = []
+                for f in files:
+                    if stop_event.is_set(): break
+                    futs.append(pool.submit(download_file, f, base_dest, progress, used_token, overall_task))
+                return futs
                 
+            futures = queue_downloads(files_to_download)
+            failed_files = []
+            
             for future in as_completed(futures):
                 try:
                     res = future.result()
                     if res:
-                        status, ext, size = res
+                        status, ext, size, f_info = res
                         if not ext: ext = "Desconocido"
                         if status == "success":
                             summary_stats["success"] += 1
@@ -738,8 +774,36 @@ def main():
                         elif status == "skipped":
                             summary_stats["skipped"] += 1
                         else:
-                            summary_stats["failed"] += 1
+                            failed_files.append(f_info)
+                            
+                        dn = summary_stats["success"] + len(failed_files)
+                        tot_files = len(files_to_download)
+                        new_text = f"[bold yellow]Archivos: {tot_files} | Descargados: {dn} | Restantes: {tot_files - dn}[/bold yellow]"
+                        progress.update(overall_task, display_name=new_text)
                 except: pass
+                
+            if failed_files and not stop_event.is_set():
+                console.print(f"[yellow]⏳ Reintentando {len(failed_files)} archivos fallidos...[/yellow]")
+                time.sleep(2)
+                retry_futures = queue_downloads(failed_files)
+                for future in as_completed(retry_futures):
+                    try:
+                        res = future.result()
+                        if res:
+                            status, ext, size, f_info = res
+                            if not ext: ext = "Desconocido"
+                            if status == "success":
+                                summary_stats["success"] += 1
+                                summary_stats["total_size"] += size
+                                if ext not in summary_stats["types"]:
+                                    summary_stats["types"][ext] = {"count": 0, "size": 0}
+                                summary_stats["types"][ext]["count"] += 1
+                                summary_stats["types"][ext]["size"] += size
+                            elif status == "skipped":
+                                summary_stats["skipped"] += 1
+                            else:
+                                summary_stats["failed"] += 1
+                    except: pass
                 
     if not stop_event.is_set():
         if args.zip:
