@@ -30,7 +30,7 @@ stop_event = threading.Event()
 prompt_lock = threading.Lock()
 proxies = None
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 USER_AGENT = "Mozilla/5.0"
 LOCALE_HDR = "en-US"
 TOKEN_WINDOW_SEC = 14400
