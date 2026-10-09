@@ -30,11 +30,23 @@ stop_event = threading.Event()
 prompt_lock = threading.Lock()
 proxies = None
 
-VERSION = "v1.2.0"
+VERSION = "v1.3.0"
 USER_AGENT = "Mozilla/5.0"
 LOCALE_HDR = "en-US"
 TOKEN_WINDOW_SEC = 14400
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".gofile_auth.json")
+
+# Allowed download domains – credentials are only sent to these
+ALLOWED_DOWNLOAD_DOMAINS = {
+    "gofile.io",
+    "store1.gofile.io", "store2.gofile.io", "store3.gofile.io",
+    "store4.gofile.io", "store5.gofile.io", "store6.gofile.io",
+    "store7.gofile.io", "store8.gofile.io", "store9.gofile.io",
+    "store10.gofile.io", "store11.gofile.io", "store12.gofile.io",
+    "store13.gofile.io", "store14.gofile.io", "store15.gofile.io",
+    "store16.gofile.io", "store17.gofile.io", "store18.gofile.io",
+    "store19.gofile.io", "store20.gofile.io",
+}
 
 COMMON_HEADERS = {
     "User-Agent": USER_AGENT,
@@ -106,7 +118,6 @@ def load_language(target_lang):
                     return
             except Exception:
                 pass
-    # Minimal fallback so keys don't print raw
     I18N = {"dl_task": "Downloading..."}
 
 def init_locale(arg_lang=None):
@@ -227,18 +238,17 @@ def get_token_secret():
         return _cached_token_secret
     fallback = "12af056dacea0b"
     try:
-        r = requests.get("https://gofile.io/dist/js/alljs.js", timeout=10)
+        r = requests.get("https://gofile.io/dist/js/alljs.js", proxies=proxies, timeout=10)
         if r.status_code == 200:
             match = re.search(r'="([a-zA-Z0-9]{12,20})"', r.text)
             if match:
                 candidate = match.group(1)
-                # Basic sanity check: should look like a hex-ish or alphanumeric secret
                 if len(candidate) >= 12:
                     _cached_token_secret = candidate
                     return _cached_token_secret
     except Exception:
         pass
-    log_error("Using fallback token secret – Gofile JS may have changed")
+    log_error("Using fallback token secret - Gofile JS may have changed")
     _cached_token_secret = fallback
     return fallback
 
@@ -247,6 +257,22 @@ def generate_website_token(account_token: str) -> str:
     secret = get_token_secret()
     seed = f"{USER_AGENT}::{LOCALE_HDR}::{account_token}::{time_window}::{secret}"
     return hashlib.sha256(seed.encode()).hexdigest()
+
+# ---------------------------------------------------------------------------
+# Domain validation (security: prevent credential leaks via redirects)
+# ---------------------------------------------------------------------------
+def is_allowed_domain(url: str) -> bool:
+    """Check if a URL belongs to a trusted Gofile domain."""
+    try:
+        host = urlparse(url).hostname or ""
+        # Accept exact matches or any *.gofile.io subdomain
+        if host in ALLOWED_DOWNLOAD_DOMAINS:
+            return True
+        if host.endswith(".gofile.io"):
+            return True
+        return False
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Path sanitization (security: prevent path traversal)
@@ -274,8 +300,9 @@ def safe_join(base: str, *parts) -> str:
 def fetch_folder(content_id, pwd_hash=None, folder_name=None, interactive=True):
     base_url = f"https://api.gofile.io/contents/{content_id}?cache=true"
     attempts = 0
+    max_retries = 5
 
-    while True:
+    for retry_round in range(max_retries):
         if stop_event.is_set():
             return None, None
         url = base_url + (f"&password={pwd_hash}" if pwd_hash else "")
@@ -291,6 +318,8 @@ def fetch_folder(content_id, pwd_hash=None, folder_name=None, interactive=True):
             return None, None
 
         retry_password = False
+        got_429 = False
+
         for token in tokens_to_try:
             if stop_event.is_set():
                 break
@@ -350,18 +379,31 @@ def fetch_folder(content_id, pwd_hash=None, folder_name=None, interactive=True):
                     auth_manager.remove_account(token)
                     continue
                 elif r.status_code == 429:
-                    retry_after = int(r.headers.get("Retry-After", 5))
+                    # Rate limited: wait and then retry the ENTIRE function loop
+                    raw_retry = r.headers.get("Retry-After", "5")
+                    try:
+                        wait_sec = min(int(raw_retry), 60)
+                    except ValueError:
+                        wait_sec = 5
                     console.print(t("rate_limit"))
-                    for _ in range(retry_after):
+                    for _ in range(wait_sec):
                         if stop_event.is_set():
-                            break
+                            return None, None
                         time.sleep(1)
+                    got_429 = True
+                    break  # Break from token loop to retry the whole round
 
             except Exception as e:
                 log_error(f"fetch_folder {content_id}: {e}")
 
-        if not retry_password:
-            return None, None
+        if retry_password:
+            continue  # Go to next retry_round with updated password
+        if got_429:
+            continue  # Go to next retry_round after waiting
+        # If we exhausted all tokens without success or 429, give up
+        return None, None
+
+    return None, None
 
 def find_unloaded_subfolders(node):
     unloaded = []
@@ -458,6 +500,30 @@ def verify_md5(file_path, expected_md5):
     except Exception:
         return False
 
+def validate_download(part_path, expected_size, expected_md5):
+    """
+    Strict post-download validation:
+    1. File must exist
+    2. Size must match expected (when known)
+    3. MD5 must match (when provided)
+    Returns (ok: bool, reason: str)
+    """
+    if not os.path.exists(part_path):
+        return False, "File does not exist after download"
+
+    actual_size = os.path.getsize(part_path)
+
+    # Size check (mandatory when server reports size)
+    if expected_size > 0 and actual_size != expected_size:
+        return False, f"Size mismatch: expected {expected_size}, got {actual_size}"
+
+    # MD5 check (when available)
+    if expected_md5:
+        if not verify_md5(part_path, expected_md5):
+            return False, "MD5 checksum mismatch"
+
+    return True, "OK"
+
 def fix_extensions(node):
     if node.get("type") == "folder":
         for child_node in node.get("children", {}).values():
@@ -518,6 +584,11 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
     expected_md5 = file_info.get("md5")
     rel_path = file_info.get("rel_path", "")
 
+    # Security: validate download domain before sending credentials
+    if not is_allowed_domain(link):
+        log_error(f"Blocked download from untrusted domain: {link}")
+        return ("failed", "", 0, file_info)
+
     try:
         final_dir = safe_join(dest_folder, *rel_path.split(os.sep)) if rel_path else dest_folder
     except ValueError as e:
@@ -541,12 +612,14 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
             progress.update(task_id, visible=False)
             return ("skipped", ext, 0, file_info)
 
-        # Reset headers each attempt – never carry over Range from previous attempt
+        # Reset headers each attempt
         headers = DOWNLOAD_HEADERS_BASE.copy()
-        if token:
-            headers["Cookie"] = f"accountToken={token}"
         headers["Referer"] = link
         headers["Origin"] = link
+
+        # Only attach credentials if the target is a trusted domain
+        if token and is_allowed_domain(link):
+            headers["Cookie"] = f"accountToken={token}"
 
         mode = "wb"
         downloaded = 0
@@ -560,16 +633,56 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
         progress.update(task_id, completed=downloaded, display_name=f"[cyan]⬇ {short_disp}[/cyan]")
 
         try:
-            with requests.get(link, headers=headers, stream=True, proxies=proxies, timeout=(10, 30)) as r:
+            # Disable automatic redirect following – we handle redirects manually
+            with requests.get(link, headers=headers, stream=True, proxies=proxies,
+                              timeout=(10, 30), allow_redirects=False) as r:
+
+                # Handle redirects manually to protect credentials
+                redirect_count = 0
+                while r.status_code in (301, 302, 303, 307, 308) and redirect_count < 5:
+                    redirect_count += 1
+                    redirect_url = r.headers.get("Location", "")
+                    if not redirect_url:
+                        break
+
+                    # Build new headers: strip credentials if target is not trusted
+                    redir_headers = DOWNLOAD_HEADERS_BASE.copy()
+                    redir_headers["Referer"] = link
+                    redir_headers["Origin"] = link
+                    if "Range" in headers:
+                        redir_headers["Range"] = headers["Range"]
+
+                    if token and is_allowed_domain(redirect_url):
+                        redir_headers["Cookie"] = f"accountToken={token}"
+                    # else: credentials are NOT sent to untrusted domains
+
+                    r = requests.get(redirect_url, headers=redir_headers, stream=True,
+                                     proxies=proxies, timeout=(10, 30), allow_redirects=False)
+
                 # Detect CDN HTML block (token/IP issue)
                 if "text/html" in r.headers.get("Content-Type", "") and size > 1024 * 1024:
                     auth_manager.remove_account(token)
                     raise Exception("Token expired or IP blocked by CDN")
 
-                # If we asked for Range but server returned 200 (ignored Range), start fresh
+                # If we asked for Range but server returned 200 (ignored it), start fresh
                 if mode == "ab" and r.status_code == 200:
                     mode = "wb"
                     downloaded = 0
+                    progress.update(task_id, completed=0)
+
+                # Validate Content-Range on 206 responses
+                if r.status_code == 206:
+                    content_range = r.headers.get("Content-Range", "")
+                    if content_range:
+                        # Format: "bytes START-END/TOTAL"
+                        match = re.match(r'bytes\s+(\d+)-', content_range)
+                        if match:
+                            range_start = int(match.group(1))
+                            if range_start != downloaded:
+                                # Server returned wrong range, start from scratch
+                                mode = "wb"
+                                downloaded = 0
+                                progress.update(task_id, completed=0)
 
                 r.raise_for_status()
 
@@ -582,17 +695,21 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
                             f.write(chunk)
                             progress.update(task_id, advance=len(chunk))
 
-            # Verify MD5 before committing
-            if size > 0:
-                progress.update(task_id, display_name=f"[yellow]⏳ MD5... {short_disp}[/yellow]")
-                if not verify_md5(part_path, expected_md5):
+            # Strict post-download validation
+            ok, reason = validate_download(part_path, size, expected_md5)
+            if not ok:
+                if os.path.exists(part_path):
                     os.remove(part_path)
-                    raise Exception("MD5 Hash Mismatch – retrying")
+                raise Exception(f"Validation failed: {reason}")
 
             # Atomic rename on success
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            os.rename(part_path, final_path)
+            try:
+                os.replace(part_path, final_path)
+            except OSError:
+                # os.replace may fail cross-device; fallback
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.rename(part_path, final_path)
 
             progress.update(task_id, visible=False)
             progress.update(overall_task, advance=size)
@@ -602,11 +719,11 @@ def download_file(file_info, dest_folder, progress, token, overall_task):
             err_msg = str(e)
             if attempt < 2:
                 backoff = 2 ** (attempt + 1)
-                progress.update(task_id, display_name=f"[yellow]⏳ Reintentando {backoff}s... {short_disp}[/yellow]")
+                progress.update(task_id, display_name=f"[yellow]⏳ Retry {backoff}s... {short_disp}[/yellow]")
                 time.sleep(backoff)
             else:
                 progress.update(task_id, visible=False)
-                log_error(f"Failed: {display_name} – {err_msg}")
+                log_error(f"Failed: {display_name} - {err_msg}")
                 progress.update(overall_task, advance=size)
                 return ("failed", ext, size, file_info)
 
@@ -650,13 +767,14 @@ def run_download_phase(files, label, color, base_dest, used_token, stats, worker
 
     total_bytes = sum(f.get("size", 0) for f in files)
     tot = len(files)
+    success_files = []
     failed_files = []
 
     def header_text():
-        dn = stats["success"] + len(failed_files)
+        dn = len(success_files) + len(failed_files)
         fc = len(failed_files)
         fail_txt = f" | [red]Fallidos: {fc}[/red]" if fc > 0 else ""
-        return f"[bold {color}]{label}: {tot} | Descargados: {stats['success']}{fail_txt} | Restantes: {tot - dn}[/bold {color}]"
+        return f"[bold {color}]{label}: {tot} | Descargados: {len(success_files)}{fail_txt} | Restantes: {tot - dn}[/bold {color}]"
 
     prog = make_progress_bar()
     with prog:
@@ -682,6 +800,7 @@ def run_download_phase(files, label, color, base_dest, used_token, stats, worker
                         stats["types"].setdefault(ext, {"count": 0, "size": 0})
                         stats["types"][ext]["count"] += 1
                         stats["types"][ext]["size"] += size
+                        success_files.append(f_info)
                     elif status == "skipped":
                         stats["skipped"] += 1
                     else:
@@ -690,9 +809,8 @@ def run_download_phase(files, label, color, base_dest, used_token, stats, worker
                 except Exception as e:
                     log_error(f"Future error: {e}")
 
-    # Mark definitive failures
     stats["failed"] += len(failed_files)
-    return [], failed_files
+    return success_files, failed_files
 
 # ---------------------------------------------------------------------------
 # Main
@@ -722,10 +840,21 @@ def main():
     parser.add_argument("-l", "--lang", default=None, help=t("help_lang"))
     parser.add_argument("-e", "--ext", default=None, help=t("help_ext"))
     parser.add_argument("-z", "--zip", action="store_true", help=t("help_zip"))
+    parser.add_argument("--delete-after-zip", action="store_true",
+                        help="Delete original files after creating ZIP (requires --zip)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite local files that differ from remote (skip confirmation)")
     parser.add_argument("--proxy", default=None, help=t("help_proxy"))
     parser.add_argument("--export", default=None, help=t("help_export"))
     parser.add_argument("--show-token", action="store_true", help="Show saved tokens (masked)")
     args = parser.parse_args()
+
+    # Validate --workers range
+    if args.workers < 1:
+        args.workers = 1
+    elif args.workers > 16:
+        console.print("[yellow]Warning: limiting workers to 16 to avoid rate limiting.[/yellow]")
+        args.workers = 16
 
     # --show-token
     if args.show_token:
@@ -740,10 +869,10 @@ def main():
             console.print("[yellow]No tokens saved.[/yellow]")
         sys.exit(0)
 
-    # --token: inject before anything else
+    # --token
     if args.token:
         auth_manager.add_account(args.token)
-        console.print(f"[bold green]Token added/updated.[/bold green]")
+        console.print("[bold green]Token added/updated.[/bold green]")
 
     # --help
     if args.help:
@@ -767,13 +896,20 @@ def main():
 
     print_banner()
 
-    # Parse content_id safely
+    # Parse content_id safely with full URL validation
     parsed = urlparse(args.url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        console.print(t("err_url"))
+        sys.exit(1)
+    if not parsed.hostname.endswith("gofile.io"):
+        console.print(t("err_url"))
+        sys.exit(1)
+
     path_parts = parsed.path.split("/d/")
     if len(path_parts) < 2:
         console.print(t("err_url"))
         sys.exit(1)
-    content_id = path_parts[1].split("/")[0].split("?")[0]
+    content_id = path_parts[1].split("/")[0]
 
     pwd_hash = None
     if args.password:
@@ -792,7 +928,7 @@ def main():
     load_all_subfolders(data, max_workers=args.workers)
     fix_extensions(data)
 
-    # Build file iterator
+    # Build file iterator – sanitize names for ALL paths (folders AND single files)
     seen = {}
     if data.get("type") == "folder":
         files_iterator = (
@@ -801,7 +937,9 @@ def main():
             for f in generate_file_list(child_node, "", seen)
         )
     else:
+        # Single file: sanitize its name here too (Audit Critico 1 fix)
         data["rel_path"] = ""
+        data["name"] = sanitize_path_component(data.get("name", "unnamed"))
         files_iterator = iter([data])
 
     if args.ext:
@@ -854,7 +992,15 @@ def main():
 
     # Write .gofile_id marker
     id_file = os.path.join(base_dest, ".gofile_id")
-    if not os.path.exists(id_file) or open(id_file).read().strip() != content_id:
+    write_id = True
+    if os.path.exists(id_file):
+        try:
+            with open(id_file, "r") as f:
+                if f.read().strip() == content_id:
+                    write_id = False
+        except Exception:
+            pass
+    if write_id:
         try:
             with open(id_file, "w") as f:
                 f.write(content_id)
@@ -866,10 +1012,11 @@ def main():
     summary_stats = {"total_size": 0, "types": {}, "failed": 0, "success": 0, "skipped": 0}
 
     # ------------------------------------------------------------------
-    # Phase 0: Pre-verification (multi-threaded MD5 check)
+    # Phase 0: Pre-verification (multi-threaded)
     # ------------------------------------------------------------------
     console.print(f"[yellow]Checking {len(files_to_download)} local files...[/yellow]")
     real_files = []
+    skipped_different = []
 
     def verify_local_file(f):
         fn = f["name"]
@@ -880,12 +1027,17 @@ def main():
             return ("download", f)
         fp = os.path.join(fd, fn)
         sz = f.get("size", 0)
+        md5 = f.get("md5")
+
         if os.path.exists(fp):
-            if os.path.getsize(fp) == sz and sz > 0 and verify_md5(fp, f.get("md5")):
+            local_size = os.path.getsize(fp)
+            if local_size == sz and sz > 0 and verify_md5(fp, md5):
                 return ("skipped", f)
-            elif os.path.exists(fp):
-                os.remove(fp)
-        # Also clean stale .part file if it's corrupted beyond resume
+            else:
+                # File exists but differs – DON'T delete automatically
+                return ("differs", f)
+
+        # Clean stale .part file if it's corrupted beyond resume
         part = fp + ".part"
         if os.path.exists(part) and sz > 0:
             if os.path.getsize(part) >= sz:
@@ -909,11 +1061,33 @@ def main():
                     status, f = fut.result()
                     if status == "skipped":
                         summary_stats["skipped"] += 1
+                    elif status == "differs":
+                        skipped_different.append(f)
                     else:
                         real_files.append(f)
                 except Exception as e:
                     log_error(f"verify_local_file error: {e}")
                 vp.update(vtask, advance=1)
+
+    # Handle files that differ from remote
+    if skipped_different:
+        if args.overwrite:
+            # User explicitly asked to overwrite
+            for f in skipped_different:
+                fn = f["name"]
+                rp = f.get("rel_path", "")
+                try:
+                    fd = safe_join(base_dest, *rp.split(os.sep)) if rp else base_dest
+                except ValueError:
+                    continue
+                fp = os.path.join(fd, fn)
+                if os.path.exists(fp):
+                    os.remove(fp)
+                real_files.append(f)
+            console.print(f"[yellow]{len(skipped_different)} different local files will be overwritten (--overwrite).[/yellow]")
+        else:
+            console.print(f"[yellow]{len(skipped_different)} local files differ from remote (kept, use --overwrite to replace).[/yellow]")
+            summary_stats["skipped"] += len(skipped_different)
 
     files_to_download = real_files
 
@@ -971,25 +1145,35 @@ def main():
     if failed_files and not stop_event.is_set():
         console.print(f"\n[yellow]Retrying {len(failed_files)} failed files in 3 seconds...[/yellow]")
         time.sleep(3)
-        # Remove from failed count (they'll be re-counted in run_download_phase)
         summary_stats["failed"] -= len(failed_files)
         _, still_failed = run_download_phase(
             failed_files, "Retry", "yellow", base_dest, used_token, summary_stats, args.workers
         )
         if still_failed:
             console.print(f"\n[bold red]Could not download {len(still_failed)} files:[/bold red]")
-            for f in still_failed:
-                console.print(f"  [red]✗[/red] {f.get('name', '?')}")
+            for f in still_failed[:20]:
+                console.print(f"  [red]x[/red] {f.get('name', '?')}")
+            if len(still_failed) > 20:
+                console.print(f"  [dim]... and {len(still_failed) - 20} more[/dim]")
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     if not stop_event.is_set():
+        # ZIP: only compress, DON'T delete unless --delete-after-zip
         if args.zip and summary_stats["failed"] == 0:
+            zip_path = base_dest + ".zip"
             console.print(t("zipping", dest=base_dest))
             shutil.make_archive(base_dest, "zip", base_dest)
-            shutil.rmtree(base_dest)
             console.print(t("zip_done"))
+
+            if args.delete_after_zip:
+                # Verify ZIP integrity before deleting
+                if os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+                    shutil.rmtree(base_dest)
+                    console.print(f"[dim]Original folder deleted (--delete-after-zip).[/dim]")
+                else:
+                    console.print("[red]ZIP file appears invalid, keeping original folder.[/red]")
 
         console.print(t("summary_title"))
         console.print(t("sum_success", count=summary_stats["success"]))
